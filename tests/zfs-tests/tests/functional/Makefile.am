@@ -24,6 +24,7 @@ SUBDIRS = \
 	large_files \
 	largest_pool \
 	link_count \
+	metadata \
 	migration \
 	mmap \
 	mount \

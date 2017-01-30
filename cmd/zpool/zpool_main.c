@@ -27,6 +27,7 @@
  * Copyright (c) 2012 by Cyril Plisko. All rights reserved.
  * Copyright (c) 2013 by Prasad Joshi (sTec). All rights reserved.
  * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>.
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 #include <assert.h>
@@ -371,7 +372,7 @@ print_prop_cb(int prop, void *cb)
 {
 	FILE *fp = cb;
 
-	(void) fprintf(fp, "\t%-15s  ", zpool_prop_to_name(prop));
+	(void) fprintf(fp, "\t%-19s  ", zpool_prop_to_name(prop));
 
 	if (zpool_prop_readonly(prop))
 		(void) fprintf(fp, "  NO   ");
@@ -423,14 +424,14 @@ usage(boolean_t requested)
 		(void) fprintf(fp,
 		    gettext("\nthe following properties are supported:\n"));
 
-		(void) fprintf(fp, "\n\t%-15s  %s   %s\n\n",
+		(void) fprintf(fp, "\n\t%-19s  %s   %s\n\n",
 		    "PROPERTY", "EDIT", "VALUES");
 
 		/* Iterate over all properties */
 		(void) zprop_iter(print_prop_cb, fp, B_FALSE, B_TRUE,
 		    ZFS_TYPE_POOL);
 
-		(void) fprintf(fp, "\t%-15s   ", "feature@...");
+		(void) fprintf(fp, "\t%-19s   ", "feature@...");
 		(void) fprintf(fp, "YES   disabled | enabled | active\n");
 
 		(void) fprintf(fp, gettext("\nThe feature@ properties must be "
@@ -448,7 +449,10 @@ usage(boolean_t requested)
 	exit(requested ? 0 : 2);
 }
 
-void
+/*
+ * print a pool vdev config for dry runs
+ */
+static void
 print_vdev_tree(zpool_handle_t *zhp, const char *name, nvlist_t *nv, int indent,
     boolean_t print_logs, int name_flags)
 {
@@ -699,8 +703,9 @@ zpool_do_add(int argc, char **argv)
 
 		/* print original main pool and new tree */
 		print_vdev_tree(zhp, poolname, poolnvroot, 0, B_FALSE,
-		    name_flags);
-		print_vdev_tree(zhp, NULL, nvroot, 0, B_FALSE, name_flags);
+		    name_flags | VDEV_NAME_TYPE_ID | VDEV_NAME_ALLOC_BIAS);
+		print_vdev_tree(zhp, NULL, nvroot, 0, B_FALSE,
+		    name_flags | VDEV_NAME_ALLOC_BIAS);
 
 		/* Do the same for the logs */
 		if (num_logs(poolnvroot) > 0) {
@@ -1182,7 +1187,9 @@ zpool_do_create(int argc, char **argv)
 		(void) printf(gettext("would create '%s' with the "
 		    "following layout:\n\n"), poolname);
 
-		print_vdev_tree(NULL, poolname, nvroot, 0, B_FALSE, 0);
+		print_vdev_tree(NULL, poolname, nvroot, 0, B_FALSE,
+		    VDEV_NAME_ALLOC_BIAS);
+
 		if (num_logs(nvroot) > 0)
 			print_vdev_tree(NULL, "logs", nvroot, 0, B_TRUE, 0);
 
@@ -1798,6 +1805,8 @@ print_logs(zpool_handle_t *zhp, status_cbdata_t *cb, nvlist_t *nv)
 {
 	uint_t c, children;
 	nvlist_t **child;
+
+	assert(zhp != NULL || !cb->cb_verbose);
 
 	if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_CHILDREN, &child,
 	    &children) != 0)
@@ -3326,7 +3335,7 @@ print_iostat_default(vdev_stat_t *vs, iostat_cbdata_t *cb, double scale)
  *
  * Returns the number of stat lines printed.
  */
-unsigned int
+static unsigned int
 print_vdev_stats(zpool_handle_t *zhp, const char *name, nvlist_t *oldnv,
     nvlist_t *newnv, iostat_cbdata_t *cb, int depth)
 {
@@ -3463,7 +3472,7 @@ children:
 			continue;
 
 		vname = zpool_vdev_name(g_zfs, zhp, newchild[c],
-		    cb->cb_name_flags);
+		    cb->cb_name_flags | VDEV_NAME_ALLOC_BIAS);
 		ret += print_vdev_stats(zhp, vname, oldnv ? oldchild[c] : NULL,
 		    newchild[c], cb, depth + 2);
 		free(vname);
@@ -3612,7 +3621,7 @@ get_namewidth(zpool_handle_t *zhp, void *data)
 		else
 			cb->cb_namewidth = MAX(poolname_len,
 			    max_width(zhp, nvroot, 0, cb->cb_namewidth,
-			    cb->cb_name_flags));
+			    cb->cb_name_flags | VDEV_NAME_ALLOC_BIAS));
 	}
 	/*
 	 * The width must be at least 10, but may be as large as the
@@ -4373,7 +4382,7 @@ print_header(list_cbdata_t *cb)
 
 /*
  * Given a pool and a list of properties, print out all the properties according
- * to the described layout.
+ * to the described layout. Used by zpool_do_list().
  */
 static void
 print_pool(zpool_handle_t *zhp, list_cbdata_t *cb)
@@ -4565,7 +4574,7 @@ print_list_stats(zpool_handle_t *zhp, const char *name, nvlist_t *nv,
 		}
 
 		vname = zpool_vdev_name(g_zfs, zhp, child[c],
-		    cb->cb_name_flags);
+		    cb->cb_name_flags | VDEV_NAME_ALLOC_BIAS);
 		print_list_stats(zhp, vname, child[c], cb, depth + 2);
 		free(vname);
 	}
@@ -4622,13 +4631,17 @@ list_callback(zpool_handle_t *zhp, void *data)
 
 	config = zpool_get_config(zhp, NULL);
 
-	print_pool(zhp, cbp);
-	if (!cbp->cb_verbose)
-		return (0);
+	if (cbp->cb_verbose) {
+		verify(nvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE,
+		    &nvroot) == 0);
+		cbp->cb_namewidth = max_width(zhp, nvroot, 0, 0,
+		    cbp->cb_name_flags | VDEV_NAME_ALLOC_BIAS);
+	}
 
-	verify(nvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE,
-	    &nvroot) == 0);
-	print_list_stats(zhp, NULL, nvroot, cbp, 0);
+	print_pool(zhp, cbp);
+
+	if (cbp->cb_verbose)
+		print_list_stats(zhp, NULL, nvroot, cbp, 0);
 
 	return (0);
 }
@@ -6003,7 +6016,8 @@ status_callback(zpool_handle_t *zhp, void *data)
 		print_scan_status(ps);
 
 		cbp->cb_namewidth = max_width(zhp, nvroot, 0, 0,
-		    cbp->cb_name_flags | VDEV_NAME_TYPE_ID);
+		    cbp->cb_name_flags | VDEV_NAME_TYPE_ID |
+		    VDEV_NAME_ALLOC_BIAS);
 		if (cbp->cb_namewidth < 10)
 			cbp->cb_namewidth = 10;
 
@@ -6011,8 +6025,10 @@ status_callback(zpool_handle_t *zhp, void *data)
 		(void) printf(gettext("\t%-*s  %-8s %5s %5s %5s\n"),
 		    cbp->cb_namewidth, "NAME", "STATE", "READ", "WRITE",
 		    "CKSUM");
+		cbp->cb_name_flags |= VDEV_NAME_ALLOC_BIAS;
 		print_status_config(zhp, cbp, zpool_get_name(zhp), nvroot, 0,
 		    B_FALSE);
+		cbp->cb_name_flags &= ~VDEV_NAME_ALLOC_BIAS;
 
 		if (num_logs(nvroot) > 0)
 			print_logs(zhp, cbp, nvroot);

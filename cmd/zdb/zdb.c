@@ -786,7 +786,8 @@ dump_metaslab(metaslab_t *msp)
 	}
 
 	if (dump_opt['d'] > 5 || dump_opt['m'] > 3) {
-		ASSERT(msp->ms_size == (1ULL << vd->vdev_ms_shift));
+		ASSERT(msp->ms_size == (1ULL << vd->vdev_ms_shift) ||
+		       vd->vdev_ops == &vdev_draid_ops);
 
 		mutex_enter(&msp->ms_lock);
 		dump_spacemap(spa->spa_meta_objset, msp->ms_sm);
@@ -3590,7 +3591,7 @@ pool_match(nvlist_t *cfg, char *tgt)
 }
 
 static char *
-find_zpool(char **target, nvlist_t **configp, int dirc, char **dirv)
+find_zpool(char **target, nvlist_t **configp, nvlist_t *draidcfg, int dirc, char **dirv)
 {
 	nvlist_t *pools;
 	nvlist_t *match = NULL;
@@ -3609,7 +3610,7 @@ find_zpool(char **target, nvlist_t **configp, int dirc, char **dirv)
 		*sepp = '\0';
 	}
 
-	pools = zpool_search_import(g_zfs, &args);
+	pools = zpool_search_import(g_zfs, draidcfg, &args);
 
 	if (pools != NULL) {
 		nvpair_t *elem = NULL;
@@ -3675,6 +3676,7 @@ main(int argc, char **argv)
 	int rewind = ZPOOL_NEVER_REWIND;
 	char *spa_config_path_env;
 	boolean_t target_is_spa = B_TRUE;
+	nvlist_t *draidcfg = NULL;
 
 	(void) setrlimit(RLIMIT_NOFILE, &rl);
 	(void) enable_extended_FILE_stdio(-1, -1);
@@ -3691,7 +3693,7 @@ main(int argc, char **argv)
 		spa_config_path = spa_config_path_env;
 
 	while ((c = getopt(argc, argv,
-	    "bcdhilmMI:suCDRSAFLXx:evp:t:U:PV")) != -1) {
+	    "bcdhilmMI:suCDRSAFLXx:y:evp:t:U:PV")) != -1) {
 		switch (c) {
 		case 'b':
 		case 'c':
@@ -3747,6 +3749,15 @@ main(int argc, char **argv)
 			break;
 		case 'x':
 			vn_dumpdir = optarg;
+			break;
+		case 'y':
+			/* HH todo: allow multiple draidcfg to be specified in case
+			 * there are multiple draid vdevs in the pool
+			 */
+			draidcfg = draidcfg_read_file(optarg);
+			if (draidcfg == NULL)
+				(void) fprintf(stderr,
+					"invalid draid configuration '%s'\n", optarg);
 			break;
 		case 't':
 			max_txg = strtoull(optarg, NULL, 0);
@@ -3839,7 +3850,7 @@ main(int argc, char **argv)
 
 	if (dump_opt['e']) {
 		nvlist_t *cfg = NULL;
-		char *name = find_zpool(&target, &cfg, nsearch, searchdirs);
+		char *name = find_zpool(&target, &cfg, draidcfg, nsearch, searchdirs);
 
 		error = ENOENT;
 		if (name) {

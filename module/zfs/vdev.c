@@ -32,6 +32,7 @@
 #include <sys/dmu.h>
 #include <sys/dmu_tx.h>
 #include <sys/vdev_impl.h>
+#include <sys/vdev_draid_impl.h>
 #include <sys/uberblock_impl.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
@@ -60,6 +61,8 @@ int metaslabs_per_vdev = 200;
 static vdev_ops_t *vdev_ops_table[] = {
 	&vdev_root_ops,
 	&vdev_raidz_ops,
+	&vdev_draid_ops,
+	&vdev_draid_spare_ops,
 	&vdev_mirror_ops,
 	&vdev_replacing_ops,
 	&vdev_spare_ops,
@@ -135,6 +138,15 @@ vdev_get_min_asize(vdev_t *vd)
 	 */
 	if (pvd->vdev_ops == &vdev_raidz_ops)
 		return (pvd->vdev_min_asize / pvd->vdev_children);
+
+	if (pvd->vdev_ops == &vdev_draid_ops) {
+		struct vdev_draid_configuration *cfg = pvd->vdev_tsd;
+
+		ASSERT(cfg != NULL);
+		ASSERT3U(pvd->vdev_nparity, ==, cfg->dcf_parity);
+		ASSERT3U(pvd->vdev_children, ==, cfg->dcf_children);
+		return pvd->vdev_min_asize / (pvd->vdev_children - cfg->dcf_spare);
+	}
 
 	return (pvd->vdev_min_asize);
 }
@@ -347,6 +359,7 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 	vd->vdev_ops = ops;
 	vd->vdev_state = VDEV_STATE_CLOSED;
 	vd->vdev_ishole = (ops == &vdev_hole_ops);
+	vd->vdev_cfg = NULL;
 
 	/*
 	 * Initialize rate limit structs for events.  We rate limit ZIO delay
@@ -391,6 +404,7 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	char *type;
 	uint64_t guid = 0, islog, nparity;
 	vdev_t *vd;
+	nvlist_t *draidcfg = NULL;
 
 	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
 
@@ -445,7 +459,7 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	 * Set the nparity property for RAID-Z vdevs.
 	 */
 	nparity = -1ULL;
-	if (ops == &vdev_raidz_ops) {
+	if (ops == &vdev_raidz_ops || ops == &vdev_draid_ops) {
 		if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_NPARITY,
 		    &nparity) == 0) {
 			if (nparity == 0 || nparity > VDEV_RAIDZ_MAXPARITY)
@@ -477,13 +491,23 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	}
 	ASSERT(nparity != -1ULL);
 
+	if (ops == &vdev_draid_ops) {
+		if (nvlist_lookup_nvlist(nv, ZPOOL_CONFIG_DRAIDCFG, &draidcfg) != 0)
+			return (SET_ERROR(EINVAL));
+		if (!vdev_draid_config_validate(NULL, draidcfg))
+			return (SET_ERROR(EINVAL));
+	}
+
 	vd = vdev_alloc_common(spa, id, guid, ops);
 
 	vd->vdev_islog = islog;
 	vd->vdev_nparity = nparity;
+	if (ops == &vdev_draid_ops)
+		vd->vdev_cfg = fnvlist_dup(draidcfg);
 
 	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_PATH, &vd->vdev_path) == 0)
 		vd->vdev_path = spa_strdup(vd->vdev_path);
+
 	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_DEVID, &vd->vdev_devid) == 0)
 		vd->vdev_devid = spa_strdup(vd->vdev_devid);
 	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_PHYS_PATH,
@@ -690,6 +714,9 @@ vdev_free(vdev_t *vd)
 		spa_spare_remove(vd);
 	if (vd->vdev_isl2cache)
 		spa_l2cache_remove(vd);
+
+	if (vd->vdev_cfg)
+		fnvlist_free(vd->vdev_cfg);
 
 	txg_list_destroy(&vd->vdev_ms_list);
 	txg_list_destroy(&vd->vdev_dtl_list);
@@ -1058,6 +1085,9 @@ vdev_probe(vdev_t *vd, zio_t *zio)
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
 
+	if (vd->vdev_ops == &vdev_draid_spare_ops)
+		return (NULL);
+
 	/*
 	 * Don't probe the probe.
 	 */
@@ -1378,6 +1408,7 @@ vdev_open(vdev_t *vd)
 	 * vdev open for business.
 	 */
 	if (vd->vdev_ops->vdev_op_leaf &&
+	    vd->vdev_ops != &vdev_draid_spare_ops &&
 	    (error = zio_wait(vdev_probe(vd, NULL))) != 0) {
 		vdev_set_state(vd, B_TRUE, VDEV_STATE_FAULTED,
 		    VDEV_AUX_ERR_EXCEEDED);
@@ -3002,7 +3033,8 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 				uint64_t *processed = &scn_phys->scn_processed;
 
 				/* XXX cleanup? */
-				if (vd->vdev_ops->vdev_op_leaf)
+				if (vd->vdev_ops->vdev_op_leaf &&
+				    vd->vdev_ops != &vdev_draid_spare_ops)
 					atomic_add_64(processed, psize);
 				vs->vs_scan_processed += psize;
 			}
@@ -3077,7 +3109,8 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 
 	if (type == ZIO_TYPE_WRITE && txg != 0 &&
 	    (!(flags & ZIO_FLAG_IO_REPAIR) ||
-	    (flags & ZIO_FLAG_SCAN_THREAD) ||
+	     /* HH: todo proper rebuild IO error handling... */
+	    ((flags & ZIO_FLAG_SCAN_THREAD) && !spa->spa_dsl_pool->dp_scan->scn_is_sequential) ||
 	    spa->spa_claiming)) {
 		/*
 		 * This is either a normal write (not a repair), or it's

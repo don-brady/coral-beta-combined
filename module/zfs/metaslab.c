@@ -1464,16 +1464,25 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 
 		ASSERT(ms->ms_sm != NULL);
 
-		/* check for segregated vdev's persistent allocation class */
+		/* check for segregated vdev's persistent allocation bias */
 		if (vd->vdev_alloc_bias == VDEV_BIAS_SEGREGATE) {
-			map_alloc_class_t alloc_class;
+			map_alloc_bias_t alloc_bias;
 
-			alloc_class = space_map_get_alloc_class(ms->ms_sm);
-			if (alloc_class == SM_ALLOC_CLASS_METADATA ||
-			    alloc_class == SM_ALLOC_CLASS_SMALLBLKS)
+			alloc_bias = space_map_get_alloc_bias(ms->ms_sm);
+			if (alloc_bias == SM_ALLOC_BIAS_METADATA ||
+			    alloc_bias == SM_ALLOC_BIAS_SMALLBLKS)
 				mg = vdev_get_mg(vd, custom_class);
-			else if (alloc_class == SM_ALLOC_CLASS_LOG)
+			else if (alloc_bias == SM_ALLOC_BIAS_LOG)
 				mg = vdev_get_mg(vd, log_class);
+		}
+
+		/*
+		 * TBD - this should use a space_map API
+		 */
+		if (ms->ms_sm->sm_dbuf != NULL &&
+		    ms->ms_sm->sm_phys->smp_alloc_info.enabled_birth != 0) {
+			ms->ms_category_enabled_birth =
+			    ms->ms_sm->sm_phys->smp_alloc_info.enabled_birth;
 		}
 
 	} else if (vd->vdev_alloc_bias == VDEV_BIAS_SEGREGATE) {
@@ -1520,6 +1529,13 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 	metaslab_group_add(mg, ms);
 
 	metaslab_set_fragmentation(ms);
+
+	if (ms->ms_category_enabled_birth == 0 &&
+	    vd->vdev_alloc_bias != VDEV_BIAS_NONE &&
+	    vd->vdev_alloc_bias != VDEV_BIAS_LOG) {
+		ms->ms_category_enabled_birth =
+		    (txg != 0) ? txg : spa_first_txg(spa);
+	}
 
 	/*
 	 * If we're opening an existing pool (txg == 0) or creating
@@ -1577,6 +1593,10 @@ metaslab_fini(metaslab_t *msp)
 	for (t = 0; t < TXG_SIZE; t++) {
 		range_tree_destroy(msp->ms_alloctree[t]);
 		range_tree_destroy(msp->ms_freetree[t]);
+
+		VERIFY0(msp->ms_dedup_count[t]);
+		VERIFY0(msp->ms_metadata_count[t]);
+		VERIFY0(msp->ms_smallblks_count[t]);
 	}
 
 	for (t = 0; t < TXG_DEFER_SIZE; t++) {
@@ -2339,13 +2359,13 @@ metaslab_sync(metaslab_t *msp, uint64_t txg)
 		/* segregated vdev persistent class */
 		if (vd->vdev_alloc_bias == VDEV_BIAS_SEGREGATE) {
 			if (mg->mg_class == spa_custom_class(spa)) {
-				space_map_set_alloc_class(msp->ms_sm,
+				space_map_set_alloc_bias(msp->ms_sm,
 				    spa->spa_segregate_smallblks ?
-				    SM_ALLOC_CLASS_SMALLBLKS :
-				    SM_ALLOC_CLASS_METADATA);
+				    SM_ALLOC_BIAS_SMALLBLKS :
+				    SM_ALLOC_BIAS_METADATA);
 			} else if (mg->mg_class == spa_log_class(spa)) {
-				space_map_set_alloc_class(msp->ms_sm,
-				    SM_ALLOC_CLASS_LOG);
+				space_map_set_alloc_bias(msp->ms_sm,
+				    SM_ALLOC_BIAS_LOG);
 			}
 		}
 	}
@@ -2360,6 +2380,26 @@ metaslab_sync(metaslab_t *msp, uint64_t txg)
 	metaslab_group_histogram_verify(mg);
 	metaslab_class_histogram_verify(mg->mg_class);
 	metaslab_group_histogram_remove(mg, msp);
+
+	/*
+	 * Synchronize the allocation-by-type data into space map header,
+	 * which will be written as part of space_map_write(), and reset
+	 * counters for the next txg.
+	 */
+	if (msp->ms_category_enabled_birth != 0) {
+		/* TBD -- need an API to activate and check birth time */
+		if (msp->ms_sm->sm_phys->smp_alloc_info.enabled_birth == 0) {
+			msp->ms_sm->sm_phys->smp_alloc_info.enabled_birth =
+			    msp->ms_category_enabled_birth;
+		}
+		space_map_sync_block_allocations(msp->ms_sm,
+		    msp->ms_dedup_count[txg & TXG_MASK],
+		    msp->ms_metadata_count[txg & TXG_MASK],
+		    msp->ms_smallblks_count[txg & TXG_MASK]);
+		msp->ms_dedup_count[txg & TXG_MASK] = 0;
+		msp->ms_metadata_count[txg & TXG_MASK] = 0;
+		msp->ms_smallblks_count[txg & TXG_MASK] = 0;
+	}
 
 	if (msp->ms_loaded && spa_sync_pass(spa) == 1 &&
 	    metaslab_should_condense(msp)) {
@@ -2828,8 +2868,68 @@ metaslab_group_alloc_verify(spa_t *spa, const blkptr_t *bp, void *tag)
 #endif
 }
 
+/*
+ * Category selection -- must be symmetric across allocate and free
+ */
+static metaslab_block_category_t
+metaslab_block_category(const blkptr_t *bp)
+{
+	dmu_object_type_t type = BP_GET_TYPE(bp);
+
+	ASSERT(!BP_IS_EMBEDDED(bp));
+	ASSERT(DMU_OT_IS_VALID(type));
+
+	if (DMU_OT_IS_DDT(type))
+		return (MS_CATEGORY_DEDUP);
+
+	if (DMU_OT_IS_ZIL(type))
+		return (MS_CATEGORY_LOG);
+
+	if (BP_GET_LEVEL(bp) > 0 || DMU_OT_IS_METADATA(type))
+		return (MS_CATEGORY_METADATA);
+
+	if (BP_GET_PSIZE(bp) <= zfs_class_smallblk_limit)
+		return (MS_CATEGORY_SMALL);
+
+	return (MS_CATEGORY_REGULAR);
+}
+
+static void
+metaslab_block_track(metaslab_t *msp, uint64_t size,
+    metaslab_block_category_t blkcat, uint64_t birth, uint64_t txg)
+{
+	uint64_t enabled_birth;
+
+	if (msp->ms_category_enabled_birth != 0)
+		enabled_birth = msp->ms_category_enabled_birth;
+	else
+		enabled_birth = UINT64_MAX;
+
+	/*
+	 * Only track if this metaslab is participating and in the case
+	 * of free if the block was allocated after we opted in.
+	 */
+	if (birth < enabled_birth)
+		return;
+
+	switch (blkcat) {
+	case MS_CATEGORY_DEDUP:
+		msp->ms_dedup_count[txg & TXG_MASK] += size;
+		break;
+	case MS_CATEGORY_METADATA:
+		msp->ms_metadata_count[txg & TXG_MASK] += size;
+		break;
+	case MS_CATEGORY_SMALL:
+		msp->ms_smallblks_count[txg & TXG_MASK] += size;
+		break;
+	default:
+		break;
+	}
+}
+
 static uint64_t
-metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t txg)
+metaslab_block_alloc(metaslab_t *msp, uint64_t size,
+    metaslab_block_category_t blkcat, uint64_t txg)
 {
 	uint64_t start;
 	range_tree_t *rt = msp->ms_tree;
@@ -2851,6 +2951,7 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t txg)
 			vdev_dirty(mg->mg_vd, VDD_METASLAB, msp, txg);
 
 		range_tree_add(msp->ms_alloctree[txg & TXG_MASK], start, size);
+		metaslab_block_track(msp, size, blkcat, txg, txg);
 
 		/* Track the last successful allocation */
 		msp->ms_alloc_txg = txg;
@@ -2867,7 +2968,8 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size, uint64_t txg)
 
 static uint64_t
 metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
-    uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d)
+    uint64_t asize, metaslab_block_category_t blkcat, uint64_t txg,
+    boolean_t want_unique, dva_t *dva, int d)
 {
 	metaslab_t *msp = NULL;
 	metaslab_t *search;
@@ -3000,7 +3102,7 @@ metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
 			continue;
 		}
 
-		offset = metaslab_block_alloc(msp, asize, txg);
+		offset = metaslab_block_alloc(msp, asize, blkcat, txg);
 		metaslab_trace_add(zal, mg, msp, asize, d, offset);
 
 		if (offset != -1ULL) {
@@ -3057,12 +3159,13 @@ next:
 
 static uint64_t
 metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
-    uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d)
+    uint64_t asize, metaslab_block_category_t blkcat, uint64_t txg,
+    boolean_t want_unique, dva_t *dva, int d)
 {
 	uint64_t offset;
 	ASSERT(mg->mg_initialized);
 
-	offset = metaslab_group_alloc_normal(mg, zal, asize, txg,
+	offset = metaslab_group_alloc_normal(mg, zal, asize, blkcat, txg,
 	    want_unique, dva, d);
 
 	mutex_enter(&mg->mg_lock);
@@ -3095,8 +3198,8 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
  */
 static int
 metaslab_alloc_dva(spa_t *spa, metaslab_class_t *mc, uint64_t psize,
-    dva_t *dva, int d, dva_t *hintdva, uint64_t txg, int flags,
-    zio_alloc_list_t *zal)
+    metaslab_block_category_t blkcat, dva_t *dva, int d, dva_t *hintdva,
+    uint64_t txg, int flags, zio_alloc_list_t *zal)
 {
 	metaslab_group_t *mg, *fast_mg, *rotor;
 	vdev_t *vd;
@@ -3238,8 +3341,8 @@ top:
 		 * in this BP (unique=true).  If we are trying hard, then
 		 * allow any metaslab to be used (unique=false).
 		 */
-		offset = metaslab_group_alloc(mg, zal, asize, txg, !try_hard,
-		    dva, d);
+		offset = metaslab_group_alloc(mg, zal, asize, blkcat, txg,
+		    !try_hard, dva, d);
 
 		if (offset != -1ULL) {
 			/*
@@ -3332,7 +3435,9 @@ next:
  * transaction group.
  */
 static void
-metaslab_free_dva(spa_t *spa, const dva_t *dva, uint64_t txg, boolean_t now)
+metaslab_free_dva(spa_t *spa, const dva_t *dva,
+    metaslab_block_category_t blkcat, uint64_t blkbirth,
+    uint64_t txg, boolean_t now)
 {
 	uint64_t vdev = DVA_GET_VDEV(dva);
 	uint64_t offset = DVA_GET_OFFSET(dva);
@@ -3361,6 +3466,7 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva, uint64_t txg, boolean_t now)
 	if (now) {
 		range_tree_remove(msp->ms_alloctree[txg & TXG_MASK],
 		    offset, size);
+		metaslab_block_track(msp, -size, blkcat, blkbirth, txg);
 
 		VERIFY(!msp->ms_condensing);
 		VERIFY3U(offset, >=, msp->ms_start);
@@ -3376,6 +3482,7 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva, uint64_t txg, boolean_t now)
 			vdev_dirty(vd, VDD_METASLAB, msp, txg);
 		range_tree_add(msp->ms_freetree[txg & TXG_MASK],
 		    offset, size);
+		metaslab_block_track(msp, -size, blkcat, blkbirth, txg);
 	}
 
 	mutex_exit(&msp->ms_lock);
@@ -3388,7 +3495,8 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva, uint64_t txg, boolean_t now)
  * group didn't commit yet.
  */
 static int
-metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
+metaslab_claim_dva(spa_t *spa, const dva_t *dva,
+    metaslab_block_category_t blkcat, uint64_t txg)
 {
 	uint64_t vdev = DVA_GET_VDEV(dva);
 	uint64_t offset = DVA_GET_OFFSET(dva);
@@ -3431,6 +3539,7 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva, uint64_t txg)
 		if (range_tree_space(msp->ms_alloctree[txg & TXG_MASK]) == 0)
 			vdev_dirty(vd, VDD_METASLAB, msp, txg);
 		range_tree_add(msp->ms_alloctree[txg & TXG_MASK], offset, size);
+		metaslab_block_track(msp, size, blkcat, txg, txg);
 	}
 
 	mutex_exit(&msp->ms_lock);
@@ -3498,6 +3607,7 @@ metaslab_alloc(spa_t *spa, metaslab_class_t *mc, uint64_t psize, blkptr_t *bp,
 {
 	dva_t *dva = bp->blk_dva;
 	dva_t *hintdva = hintbp->blk_dva;
+	metaslab_block_category_t blkcat = metaslab_block_category(bp);
 	int d, error = 0;
 
 	ASSERT(bp->blk_birth == 0);
@@ -3516,11 +3626,12 @@ metaslab_alloc(spa_t *spa, metaslab_class_t *mc, uint64_t psize, blkptr_t *bp,
 	ASSERT3P(zal, !=, NULL);
 
 	for (d = 0; d < ndvas; d++) {
-		error = metaslab_alloc_dva(spa, mc, psize, dva, d, hintdva,
-		    txg, flags, zal);
+		error = metaslab_alloc_dva(spa, mc, psize, blkcat, dva, d,
+		    hintdva, txg, flags, zal);
 		if (error != 0) {
 			for (d--; d >= 0; d--) {
-				metaslab_free_dva(spa, &dva[d], txg, B_TRUE);
+				metaslab_free_dva(spa, &dva[d], blkcat, txg,
+				    txg, B_TRUE);
 				metaslab_group_alloc_decrement(spa,
 				    DVA_GET_VDEV(&dva[d]), zio, flags);
 				bzero(&dva[d], sizeof (dva_t));
@@ -3551,6 +3662,8 @@ void
 metaslab_free(spa_t *spa, const blkptr_t *bp, uint64_t txg, boolean_t now)
 {
 	const dva_t *dva = bp->blk_dva;
+	metaslab_block_category_t blkcat = metaslab_block_category(bp);
+	uint64_t blkbirth = BP_PHYSICAL_BIRTH(bp);
 	int d, ndvas = BP_GET_NDVAS(bp);
 
 	ASSERT(!BP_IS_HOLE(bp));
@@ -3559,7 +3672,7 @@ metaslab_free(spa_t *spa, const blkptr_t *bp, uint64_t txg, boolean_t now)
 	spa_config_enter(spa, SCL_FREE, FTAG, RW_READER);
 
 	for (d = 0; d < ndvas; d++)
-		metaslab_free_dva(spa, &dva[d], txg, now);
+		metaslab_free_dva(spa, &dva[d], blkcat, blkbirth, txg, now);
 
 	spa_config_exit(spa, SCL_FREE, FTAG);
 }
@@ -3568,6 +3681,7 @@ int
 metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 {
 	const dva_t *dva = bp->blk_dva;
+	metaslab_block_category_t blkcat = metaslab_block_category(bp);
 	int ndvas = BP_GET_NDVAS(bp);
 	int d, error = 0;
 
@@ -3584,9 +3698,11 @@ metaslab_claim(spa_t *spa, const blkptr_t *bp, uint64_t txg)
 
 	spa_config_enter(spa, SCL_ALLOC, FTAG, RW_READER);
 
-	for (d = 0; d < ndvas; d++)
-		if ((error = metaslab_claim_dva(spa, &dva[d], txg)) != 0)
+	for (d = 0; d < ndvas; d++) {
+		error = metaslab_claim_dva(spa, &dva[d], blkcat, txg);
+		if (error != 0)
 			break;
+	}
 
 	spa_config_exit(spa, SCL_ALLOC, FTAG);
 

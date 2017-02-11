@@ -1916,6 +1916,8 @@ raidz_parity_verify(zio_t *zio, raidz_map_t *rm)
 		zio_buf_free(orig[c], rc->rc_size);
 	}
 
+	if (ret != 0 && rm->rm_declustered)
+		vdev_draid_debug_zio(zio, B_FALSE);
 	return (ret);
 }
 

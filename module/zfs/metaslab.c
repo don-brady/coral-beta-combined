@@ -2116,7 +2116,6 @@ metaslab_passivate(metaslab_t *msp, uint64_t weight)
 	 * this metaslab again.  In that case, it had better be empty,
 	 * or we would be leaving space on the table.
 	 */
-
 	ASSERT(size >= SPA_MINBLOCKSIZE ||
 	    range_tree_space(msp->ms_tree) == 0);
 #endif
@@ -2619,17 +2618,6 @@ metaslab_sync_done(metaslab_t *msp, uint64_t txg)
 		}
 
 		metaslab_space_update(vd, mg->mg_class, 0, 0, msp->ms_size);
-
-		/*
-		 * For segregated vdevs, the special groups are remembered
-		 * via the space map object. So we want an object to be
-		 * created even though there are no allocations.
-		 */
-		if (txg > TXG_INITIAL &&
-		    vd->vdev_alloc_bias == VDEV_BIAS_SEGREGATE &&
-		    mg != vd->vdev_mg) {
-			vdev_dirty(vd, VDD_METASLAB, msp, txg + 1);
-		}
 	}
 
 	freed_tree = &msp->ms_freetree[TXG_CLEAN(txg) & TXG_MASK];
@@ -3629,7 +3617,6 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva,
 	if (now) {
 		range_tree_remove(msp->ms_alloctree[txg & TXG_MASK],
 		    offset, size);
-		metaslab_block_track(msp, -size, blkcat, blkbirth, txg);
 
 		VERIFY(!msp->ms_condensing);
 		VERIFY3U(offset, >=, msp->ms_start);
@@ -3645,8 +3632,8 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva,
 			vdev_dirty(vd, VDD_METASLAB, msp, txg);
 		range_tree_add(msp->ms_freetree[txg & TXG_MASK],
 		    offset, size);
-		metaslab_block_track(msp, -size, blkcat, blkbirth, txg);
 	}
+	metaslab_block_track(msp, -size, blkcat, blkbirth, txg);
 
 	mutex_exit(&msp->ms_lock);
 }

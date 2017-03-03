@@ -75,7 +75,6 @@ spa_scan_rebuild_block(zio_t *pio, vdev_t *vd, uint64_t offset, uint64_t asize)
 
 	if (vd->vdev_ops == &vdev_mirror_ops) {
 		psize = asize;
-		ASSERT3U(asize, ==, vdev_psize_to_asize(vd, psize));
 	} else if (vdev_draid_ms_mirrored(vd, offset >> vd->vdev_ms_shift)) {
 		ASSERT0((asize >> ashift) % (1 + vd->vdev_nparity));
 		psize = asize / (1 + vd->vdev_nparity);
@@ -308,6 +307,8 @@ spa_scan_thread(void *arg)
 		err = SET_ERROR(err);
 	/* HH: we don't use scn_visited_this_txg anyway */
 	spa->spa_dsl_pool->dp_scan->scn_visited_this_txg = 19890604;
+
+	thread_exit();
 }
 
 void

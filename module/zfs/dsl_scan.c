@@ -316,7 +316,7 @@ dsl_scan_done(dsl_scan_t *scn, boolean_t complete, dmu_tx_t *tx)
 	}
 
 	if (scn->scn_phys.scn_queue_obj != 0) {
-		VERIFY(0 == dmu_object_free(dp->dp_meta_objset,
+		VERIFY3U(0, ==, dmu_object_free(dp->dp_meta_objset,
 		    scn->scn_phys.scn_queue_obj, tx));
 		scn->scn_phys.scn_queue_obj = 0;
 	}
@@ -1181,10 +1181,10 @@ dsl_scan_visitds(dsl_scan_t *scn, uint64_t dsobj, dmu_tx_t *tx)
 	 * Add descendent datasets to work queue.
 	 */
 	if (dsl_dataset_phys(ds)->ds_next_snap_obj != 0) {
-		VERIFY(zap_add_int_key(dp->dp_meta_objset,
+		VERIFY0(zap_add_int_key(dp->dp_meta_objset,
 		    scn->scn_phys.scn_queue_obj,
 		    dsl_dataset_phys(ds)->ds_next_snap_obj,
-		    dsl_dataset_phys(ds)->ds_creation_txg, tx) == 0);
+		    dsl_dataset_phys(ds)->ds_creation_txg, tx));
 	}
 	if (dsl_dataset_phys(ds)->ds_num_children > 1) {
 		boolean_t usenext = B_FALSE;

@@ -81,7 +81,12 @@ static boolean_t raidz_math_initialized = B_FALSE;
 #define	RAIDZ_IMPL_READ(i)	(*(volatile uint32_t *) &(i))
 
 static uint32_t zfs_vdev_raidz_impl = IMPL_SCALAR;
+
+#ifdef VDEV_TYPE_DRAID
+static uint32_t user_sel_impl = IMPL_ORIGINAL;
+#else
 static uint32_t user_sel_impl = IMPL_FASTEST;
+#endif
 
 /* Hold all supported implementations */
 static size_t raidz_supp_impl_cnt = 0;

@@ -1694,6 +1694,11 @@ metaslab_class_t *
 spa_preferred_class(spa_t *spa, uint64_t size, int objtype, int level,
     uint64_t objset)
 {
+#if 1
+	/* Work around until CORRAIDZ-252 is picked up */
+	if (size > 4096)
+		return (spa_normal_class(spa));
+#endif
 	if (DMU_OT_IS_DDT(objtype)) {
 		if (spa->spa_dedup_class->mc_groups != 0)
 			return (spa_dedup_class(spa));
@@ -1707,7 +1712,9 @@ spa_preferred_class(spa_t *spa, uint64_t size, int objtype, int level,
 			return (spa_normal_class(spa));
 	}
 	if (DMU_OT_IS_METADATA(objtype) || level > 0) {
-		if (spa->spa_custom_class->mc_groups != 0)
+		/* DJB TBD large metadata blocks with dRAID */
+		if (spa->spa_custom_class->mc_groups != 0 &&
+		    size <= zfs_class_smallblk_limit)
 			return (spa_custom_class(spa));
 		else
 			return (spa_normal_class(spa));

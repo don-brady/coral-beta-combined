@@ -1457,7 +1457,6 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 	spa_t *spa = vd->vdev_spa;
 	objset_t *mos = spa->spa_meta_objset;
 	metaslab_t *ms;
-	metaslab_class_t *custom_class = NULL, *log_class = NULL;
 	int error;
 
 	ms = kmem_zalloc(sizeof (metaslab_t), KM_SLEEP);
@@ -1466,23 +1465,14 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 	ms->ms_id = id;
 	ms->ms_start = id << vd->vdev_ms_shift;
 	ms->ms_size = 1ULL << vd->vdev_ms_shift;
-	if (vd->vdev_ops == &vdev_draid_ops) {
-		uint64_t astart = vdev_draid_get_astart(vd, ms->ms_start);
-
-		ms->ms_size -= astart - ms->ms_start;
-		ms->ms_start = astart;
-	}
-
-	if (vd->vdev_alloc_bias == VDEV_BIAS_SEGREGATE) {
-		custom_class = spa_custom_class(spa);
-		log_class = spa_log_class(spa);
-	}
 
 	/*
 	 * We only open space map objects that already exist. All others
 	 * will be opened when we finally allocate an object for it.
 	 */
 	if (object != 0) {
+		map_alloc_bias_t alloc_bias;
+
 		error = space_map_open(&ms->ms_sm, mos, object, ms->ms_start,
 		    ms->ms_size, vd->vdev_ashift, &ms->ms_lock);
 
@@ -1494,16 +1484,36 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 		ASSERT(ms->ms_sm != NULL);
 
 		/* check for segregated vdev's persistent allocation bias */
-		if (vd->vdev_alloc_bias == VDEV_BIAS_SEGREGATE) {
-			map_alloc_bias_t alloc_bias;
+		alloc_bias = space_map_get_alloc_bias(ms->ms_sm);
 
-			alloc_bias = space_map_get_alloc_bias(ms->ms_sm);
-			if (alloc_bias == SM_ALLOC_BIAS_METADATA ||
-			    alloc_bias == SM_ALLOC_BIAS_SMALLBLKS)
-				mg = vdev_get_mg(vd, custom_class);
-			else if (alloc_bias == SM_ALLOC_BIAS_LOG)
-				mg = vdev_get_mg(vd, log_class);
+		/*
+		 * The on-disk config doesn't have the top-level vdev zap
+		 * objid.  So in some import try paths we miss seeing the
+		 * bias.  This is a work-around so that things like a
+		 * 'zdb -m' on an exported pool still show the correct
+		 * information for segregated vdevs.
+		 */
+		if (alloc_bias != SM_ALLOC_BIAS_DEFAULT &&
+		    vd->vdev_alloc_bias == VDEV_BIAS_NONE) {
+			vd->vdev_alloc_bias = VDEV_BIAS_SEGREGATE;
+			cmn_err(CE_NOTE, "metaslab_init: vd-%d, ms-%d forcing "
+			    "segregate bias via SMO %llu", (int)vd->vdev_id,
+			    (int)id, object);
+
+			if (vd->vdev_custom_mg == NULL) {
+				vd->vdev_custom_mg = metaslab_group_create(
+				    spa_custom_class(spa), vd);
+				cmn_err(CE_NOTE, "metaslab_init: vd-%d, ms-%d "
+				    "creating custom group", (int)vd->vdev_id,
+				    (int)id);
+			}
 		}
+
+		if (alloc_bias == SM_ALLOC_BIAS_METADATA ||
+		    alloc_bias == SM_ALLOC_BIAS_SMALLBLKS)
+			mg = vdev_get_mg(vd, spa_custom_class(spa));
+		else if (alloc_bias == SM_ALLOC_BIAS_LOG)
+			mg = vdev_get_mg(vd, spa_log_class(spa));
 
 		/*
 		 * TBD - this should use a space_map API
@@ -1530,7 +1540,7 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 		 * is reached.
 		 */
 		if (spa->spa_segregate_log &&
-		    (altmg = vdev_get_mg(vd, log_class)) != NULL &&
+		    (altmg = vdev_get_mg(vd, spa_log_class(spa))) != NULL &&
 		    avl_numnodes(&altmg->mg_metaslab_tree) == 0) {
 			/* Set aside one metaslab for log allocations */
 			mg = altmg;
@@ -1547,10 +1557,33 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 			    (vd->vdev_ms_count * percent) / 100);
 
 			if (goal > 0 &&
-			    (altmg = vdev_get_mg(vd, custom_class)) != NULL &&
+			    (altmg = vdev_get_mg(vd, spa_custom_class(spa))) !=
+			    NULL &&
 			    avl_numnodes(&altmg->mg_metaslab_tree) < goal) {
 				/* Set aside for metadata & small blocks */
 				mg = altmg;
+			}
+		}
+	}
+
+	if (vd->vdev_ops == &vdev_draid_ops) {
+		boolean_t mirror = (mg == vd->vdev_custom_mg);
+		uint64_t astart;
+
+		astart = vdev_draid_get_astart(vd, ms->ms_start, mirror);
+		ms->ms_size -= astart - ms->ms_start;
+		ms->ms_start = astart;
+
+		/* re-open with adjusted start and size */
+		if (ms->ms_sm != NULL) {
+			space_map_close(ms->ms_sm);
+			ms->ms_sm = NULL;
+			error = space_map_open(&ms->ms_sm, mos, object,
+			    ms->ms_start, ms->ms_size, vd->vdev_ashift,
+			    &ms->ms_lock);
+			if (error != 0) {
+				kmem_free(ms, sizeof (metaslab_t));
+				return (error);
 			}
 		}
 	}
@@ -1579,7 +1612,7 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object, uint64_t txg,
 	 * and/or small blocks, then update the goal space
 	 * for the category
 	 */
-	if (mg == vdev_get_mg(vd, custom_class) ||
+	if (mg == vdev_get_mg(vd, spa_custom_class(spa)) ||
 	    vd->vdev_alloc_bias == VDEV_BIAS_SMALLBLKS) {
 		uint64_t p1 = 0, p2 = 0;
 
@@ -3146,21 +3179,16 @@ metaslab_block_alloc(metaslab_t *msp, uint64_t size,
 
 static uint64_t
 metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
-    uint64_t psize, uint64_t asize, metaslab_block_category_t blkcat,
-    uint64_t txg, boolean_t want_unique, dva_t *dva, int d)
+    uint64_t psize, metaslab_block_category_t blkcat, uint64_t txg,
+    boolean_t want_unique, dva_t *dva, int d)
 {
 	vdev_t *vd = mg->mg_vd;
 	metaslab_t *msp = NULL;
 	metaslab_t *search;
 	uint64_t offset = -1ULL;
-	boolean_t hybrid_mirror = B_FALSE;
 	uint64_t activation_weight;
+	uint64_t asize;
 	int i;
-
-	if (vd->vdev_ops == &vdev_draid_ops &&
-	    psize <= (1ULL << vd->vdev_top->vdev_ashift)) {
-		hybrid_mirror = B_TRUE;
-	}
 
 	activation_weight = METASLAB_WEIGHT_PRIMARY;
 	for (i = 0; i < d; i++) {
@@ -3198,17 +3226,14 @@ metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
 		if (msp == NULL)
 			msp = avl_nearest(t, idx, AVL_AFTER);
 		for (; msp != NULL; msp = AVL_NEXT(t, msp)) {
+			/* asize calculation is now a late binding operation */
+			asize = vdev_psize_to_asize(vd, psize, msp->ms_start);
 
 			if (!metaslab_should_allocate(msp, asize)) {
 				metaslab_trace_add(zal, mg, msp, asize, d,
 				    TRACE_TOO_SMALL);
 				continue;
 			}
-
-			if (vd->vdev_ops == &vdev_draid_ops &&
-			    hybrid_mirror !=
-			    vdev_draid_ms_mirrored(vd, msp->ms_id))
-				continue;
 
 			/*
 			 * If the selected metaslab is condensing, skip it.
@@ -3349,13 +3374,13 @@ next:
 
 static uint64_t
 metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
-    uint64_t psize, uint64_t asize, metaslab_block_category_t blkcat,
-    uint64_t txg, boolean_t want_unique, dva_t *dva, int d)
+    uint64_t psize, metaslab_block_category_t blkcat, uint64_t txg,
+    boolean_t want_unique, dva_t *dva, int d)
 {
 	uint64_t offset;
 	ASSERT(mg->mg_initialized);
 
-	offset = metaslab_group_alloc_normal(mg, zal, psize, asize, blkcat, txg,
+	offset = metaslab_group_alloc_normal(mg, zal, psize, blkcat, txg,
 	    want_unique, dva, d);
 
 	mutex_enter(&mg->mg_lock);
@@ -3363,7 +3388,9 @@ metaslab_group_alloc(metaslab_group_t *mg, zio_alloc_list_t *zal,
 		mg->mg_failed_allocations++;
 		metaslab_trace_add(zal, mg, NULL, asize, d,
 		    TRACE_GROUP_FAILURE);
-		if (asize == SPA_GANGBLOCKSIZE) {
+		/* DJB offset here for dRAID TBD */
+		if (vdev_psize_to_asize(mg->mg_vd, psize,
+		    0) == SPA_GANGBLOCKSIZE) {
 			/*
 			 * This metaslab group was unable to allocate
 			 * the minimum gang block size so it must be out of
@@ -3522,19 +3549,18 @@ top:
 
 		ASSERT(mg->mg_class == mc);
 
-		asize = vdev_psize_to_asize(vd, psize);
-		ASSERT(P2PHASE(asize, 1ULL << vd->vdev_ashift) == 0);
-
 		/*
 		 * If we don't need to try hard, then require that the
 		 * block be on an different metaslab from any other DVAs
 		 * in this BP (unique=true).  If we are trying hard, then
 		 * allow any metaslab to be used (unique=false).
 		 */
-		offset = metaslab_group_alloc(mg, zal, psize, asize, blkcat,
-		    txg, !try_hard, dva, d);
+		offset = metaslab_group_alloc(mg, zal, psize, blkcat, txg,
+		    !try_hard, dva, d);
 
 		if (offset != -1ULL) {
+			asize = vdev_psize_to_asize(vd, psize, offset);
+
 			/*
 			 * If we've just selected this metaslab group,
 			 * figure out whether the corresponding vdev is
@@ -3649,7 +3675,7 @@ metaslab_free_dva(spa_t *spa, const dva_t *dva,
 	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
 
 	if (DVA_GET_GANG(dva))
-		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE);
+		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE, offset);
 
 	mutex_enter(&msp->ms_lock);
 
@@ -3703,7 +3729,7 @@ metaslab_claim_dva(spa_t *spa, const dva_t *dva,
 	msp = vd->vdev_ms[offset >> vd->vdev_ms_shift];
 
 	if (DVA_GET_GANG(dva))
-		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE);
+		size = vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE, offset);
 
 	mutex_enter(&msp->ms_lock);
 
